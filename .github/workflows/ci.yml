@@ -11,6 +11,10 @@ permissions:
   contents: read
 
 jobs:
+
+  # ----------------------------------------------------
+  # 1. Vérification de sécurité - exécutée en premier
+  # ----------------------------------------------------
   security:
     name: Vérification des dépendances
     runs-on: ubuntu-24.04
@@ -33,8 +37,12 @@ jobs:
         run: |
           safety check -r requirements.txt
 
-  test:
-    name: Tests et couverture
+
+  # ----------------------------------------------------
+  # 2. Vérification de la qualité du code
+  # ----------------------------------------------------
+  lint:
+    name: Lint
     runs-on: ubuntu-24.04
     needs: security
 
@@ -47,11 +55,89 @@ jobs:
         with:
           python-version: "3.10"
 
+      - name: Install linters
+        run: |
+          pip install flake8 ruff
+
+      - name: Run lint
+        run: |
+          echo "=== Lint avec flake8 ==="
+          flake8 app \
+            --count \
+            --select=E9,F63,F7,F82 \
+            --show-source \
+            --statistics
+
+          flake8 app \
+            --count \
+            --exit-zero \
+            --max-complexity=10 \
+            --max-line-length=88 \
+            --statistics
+
+          echo "=== Lint avec ruff ==="
+          ruff check .
+
+
+  # ----------------------------------------------------
+  # 3. Vérification des types
+  # ----------------------------------------------------
+  type-check:
+    name: Type check
+    runs-on: ubuntu-24.04
+    needs: lint
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install mypy
+        run: |
+          pip install mypy
+
+      - name: Run type checking
+        run: |
+          if [ -f mypy.ini ] || [ -f pyproject.toml ]; then
+            mypy app
+          else
+            echo "mypy config absent, étape ignorée"
+          fi
+
+
+  # ----------------------------------------------------
+  # 4. Tests + couverture
+  # ----------------------------------------------------
+  tests:
+    name: Tests Python ${{ matrix.python-version }}
+    runs-on: ubuntu-24.04
+
+    needs:
+      - security
+      - lint
+      - type-check
+
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
-          pip list
 
       - name: Run tests with coverage
         run: |
@@ -60,3 +146,51 @@ jobs:
             --cov=app \
             --cov-report=xml \
             --cov-report=term-missing
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: coverage.xml
+
+
+  # ----------------------------------------------------
+  # 5. Build Docker + Smoke test
+  # ----------------------------------------------------
+  docker-smoke:
+    name: Docker smoke test
+    runs-on: ubuntu-24.04
+    needs: tests
+
+    # Seulement lors d'un push sur dev
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: app:ci
+          load: true
+
+      - name: Smoke test HTTP
+        run: |
+          docker run -d -p 8000:8000 --name app app:ci
+          sleep 5
+
+          curl -fsS -X POST http://localhost:8000/predict \
+            -H "Content-Type: application/json" \
+            -d '{"features":[0.0,0.0,0.0]}' >/dev/null
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f app || true

@@ -2,3 +2,9 @@ fastapi
 uvicorn[standard]
 pydantic
 scikit-learn
+
+pytest
+pytest-cov
+httpx
+ruff
+safety
